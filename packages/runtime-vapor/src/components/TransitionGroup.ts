@@ -1,6 +1,7 @@
 import {
   type BaseTransitionProps,
   type ElementWithTransition,
+  type GenericComponentInstance,
   type TransitionGroupProps,
   type TransitionProps,
   TransitionPropsValidators,
@@ -397,6 +398,9 @@ export function resolveTransitionBlocks(
   onUpdateOwner?: (owner: TransitionGroupUpdateOwner) => void,
   // collect elements only, skipping key/type inheritance side effects
   collectOnly = false,
+  // the key of the vdom slot rendering `block` under a vdom group: the rows
+  // compose under it, as vdom's do under their slot fragment's key
+  ownerKey?: any,
 ): ResolvedTransitionBlock[] {
   const children: ResolvedTransitionBlock[] = []
   if (collectOnly) {
@@ -410,8 +414,9 @@ export function resolveTransitionBlocks(
     onFragment,
     onUpdateOwner,
     keys,
-    ROOT_KEY_CONTEXT,
+    ownerKey == null ? ROOT_KEY_CONTEXT : { key: ownerKey, slot: true },
   )
+  if (ownerKey != null) composeOwnerKey(children, 0, ownerKey, keys)
   for (let i = 0; i < children.length; i++) {
     children[i].$tkey = keys.get(children[i])
   }
@@ -458,7 +463,14 @@ function collectTransitionBlocks(
         }
       }
       // a root-slot component is transparent, like the slot outlet it wraps
-      resolveOwnerKey(children, start, block.$key, keys, !isRootSlot)
+      resolveOwnerKey(
+        children,
+        start,
+        block.$key,
+        keys,
+        !isRootSlot,
+        ctx && ctx.slot,
+      )
     }
   } else if (isArray(block)) {
     for (let i = 0; i < block.length; i++) {
@@ -497,7 +509,7 @@ function collectTransitionBlocks(
       )
       if (!keys) return
       if (!isItem) {
-        resolveOwnerKey(children, start, key, keys, false)
+        resolveOwnerKey(children, start, key, keys, false, ctx && ctx.slot)
       } else if (key != null) {
         // an unkeyed row composes nothing: its roots keep their own keys
         if (children.length - start === 1) {
@@ -516,19 +528,33 @@ function collectTransitionBlocks(
 // vdom key semantics for the block owning the collected roots: a component
 // is the child vnode, so its key is final for a single root; a fragment only
 // supplies the default key of its single root. Multiple roots compose the
-// owner key with each root's key, as vdom does for fragment children.
+// owner key with each root's key, as vdom does for fragment children. Under
+// a slot's key a fragment composes its single root's key too, as the key
+// context folds it on a branch re-render.
 function resolveOwnerKey(
   children: ResolvedTransitionBlock[],
   start: number,
   key: any,
   keys: ComposedKeys,
   final: boolean,
+  slot?: boolean,
 ): void {
   if (children.length - start === 1) {
     const child = children[start]
-    if (final || keys.get(child) == null) keys.set(child, key)
+    const inner = keys.get(child)
+    if (final || inner == null) keys.set(child, key)
+    else if (slot && key != null) keys.set(child, String(key) + String(inner))
     return
   }
+  composeOwnerKey(children, start, key, keys)
+}
+
+function composeOwnerKey(
+  children: ResolvedTransitionBlock[],
+  start: number,
+  key: any,
+  keys: ComposedKeys,
+): void {
   if (key == null) return
   for (let i = start; i < children.length; i++) {
     const child = children[i]
@@ -537,18 +563,23 @@ function resolveOwnerKey(
   }
 }
 
-function applyGroupTransitionHooks(
+// `updateHooks` are a vapor group's; a vdom group's own render and updated
+// hook cover what they report, and its slot's key is the rows' `ownerKey`.
+export function applyGroupTransitionHooks(
   block: Block,
   props: TransitionProps,
   state: TransitionState,
-  instance: VaporComponentInstance,
-  updateHooks: TransitionGroupUpdateHooks,
+  instance: GenericComponentInstance,
+  updateHooks?: TransitionGroupUpdateHooks,
+  ownerKey?: any,
 ): ResolvedTransitionBlock[] {
   const fragments: VaporFragment[] = []
   const children = resolveTransitionBlocks(
     block,
     frag => fragments.push(frag),
     owner => trackTransitionGroupUpdate(owner, instance, updateHooks),
+    false,
+    ownerKey,
   )
   for (let i = 0; i < children.length; i++) {
     const child = children[i]
@@ -570,7 +601,14 @@ function applyGroupTransitionHooks(
   fragments.forEach(frag => {
     const hooks = resolveTransitionHooks(frag, props, state, instance)
     hooks.applyGroup = (block, props, state, instance) =>
-      applyGroupTransitionHooks(block, props, state, instance, updateHooks)
+      applyGroupTransitionHooks(
+        block,
+        props,
+        state,
+        instance,
+        updateHooks,
+        ownerKey,
+      )
     frag.$transition = hooks
   })
   return children
@@ -578,12 +616,13 @@ function applyGroupTransitionHooks(
 
 function trackTransitionGroupUpdate(
   owner: TransitionGroupUpdateOwner,
-  instance: VaporComponentInstance,
-  updateHooks: TransitionGroupUpdateHooks,
+  instance: GenericComponentInstance,
+  updateHooks?: TransitionGroupUpdateHooks,
 ): void {
   if (trackedTransitionGroupOwners.has(owner)) return
 
   if (isFragment(owner)) {
+    if (!updateHooks) return
     trackedTransitionGroupOwners.add(owner)
     ;(owner.bu ||= []).push(updateHooks.beforeUpdate)
     ;(owner.u ||= []).push(updateHooks.updated)
